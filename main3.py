@@ -3,6 +3,7 @@ import json
 import requests
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -14,10 +15,11 @@ from pydantic import BaseModel
 
 API_URL = os.environ["LEDGER_API_URL"]
 
-# AI Pipe / OpenAI-compatible settings
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+BUSINESS_TZ = ZoneInfo("Asia/Kolkata")
 
 
 # ============================================================
@@ -100,7 +102,7 @@ def deduplicate_orders(orders):
 
 
 # ============================================================
-# LOAD DATA ON STARTUP
+# LOAD DATA
 # ============================================================
 
 print("Loading ledger...")
@@ -113,7 +115,7 @@ print(f"Rates: {rates}")
 
 
 # ============================================================
-# LLM
+# LLM QUESTION PARSER
 # ============================================================
 
 def understand_question(question):
@@ -123,16 +125,9 @@ You are a query parser for an appliance order ledger.
 
 Convert the user's question into JSON.
 
-Possible intent values:
-
-- revenue
-- refunds
-- product_sales
-- customer_sales
-
 Return ONLY valid JSON.
 
-Use this exact structure:
+Use EXACTLY this structure:
 
 {
   "intent": "revenue",
@@ -143,13 +138,60 @@ Use this exact structure:
   "month": null
 }
 
+Possible intent values:
+
+1. "revenue"
+   Use for questions asking total revenue.
+
+2. "refunds"
+   Use for questions asking total refunded amount.
+
+3. "product_sales"
+   Use for questions asking how many units of a product were sold.
+
+4. "customer_sales"
+   Use for questions asking how much a customer spent.
+
+5. "top_product_revenue"
+   Use when the question asks WHICH PRODUCT earned/generated/made the most
+   revenue, sales revenue, or USD revenue.
+
+   Examples:
+   - Which product earned the most USD revenue?
+   - What product generated the highest revenue?
+   - Which product made the most money?
+   - What was the top product by revenue?
+
+6. "top_product_sales"
+   Use when the question asks WHICH PRODUCT sold the most units.
+
+   Examples:
+   - Which product sold the most units?
+   - What was the best-selling product?
+   - Which product had the highest number of sales?
+
+7. "distinct_customers"
+   Use when the question asks how many UNIQUE or DISTINCT customers
+   bought a product.
+
+   Examples:
+   - How many distinct customers bought an Air Fryer?
+   - How many unique customers purchased a Kettle?
+
 Rules:
 
-- Revenue means paid orders and their amount converted to USD.
-- Refunds means orders whose status is refunded.
+- Revenue counts ONLY orders whose current status is "paid".
+- Refunds count ONLY orders whose current status is "refunded".
+- Revenue must be converted to USD using the supplied exchange rates.
+- Product sales count quantity from paid orders.
+- For "top_product_revenue", return intent "top_product_revenue".
+- For "top_product_sales", return intent "top_product_sales".
+- For "distinct_customers", return intent "distinct_customers".
+- If a product is specified, preserve its name exactly.
+- If a customer is specified, preserve the customer exactly.
+- If a region is specified, preserve the region exactly.
 - For a month, use a number from 1 to 12.
-- If the question does not specify a filter, use null.
-- Preserve region/product/customer names exactly as stated.
+- If year/month/region/product/customer is not specified, use null.
 """
 
     response = requests.post(
@@ -177,23 +219,39 @@ Rules:
 
     response.raise_for_status()
 
-    content = response.json()["choices"][0]["message"]["content"]
+    content = response.json()["choices"][0]["message"]["content"].strip()
+
+    # Handle models that occasionally return ```json ... ```
+    if content.startswith("```"):
+        content = content.replace("```json", "", 1)
+        content = content.replace("```", "")
+        content = content.strip()
 
     return json.loads(content)
 
 
 # ============================================================
-# FILTERING
+# DATE HANDLING
 # ============================================================
+
+def get_business_date(order):
+    """
+    Convert created_at into the business timezone (Asia/Kolkata).
+    """
+
+    date = datetime.fromisoformat(
+        order["created_at"].replace("Z", "+00:00")
+    )
+
+    return date.astimezone(BUSINESS_TZ)
+
 
 def matches_date(order, year, month):
 
     if year is None and month is None:
         return True
 
-    date = datetime.fromisoformat(
-        order["created_at"].replace("Z", "+00:00")
-    )
+    date = get_business_date(order)
 
     if year is not None and date.year != year:
         return False
@@ -203,6 +261,10 @@ def matches_date(order, year, month):
 
     return True
 
+
+# ============================================================
+# FILTERING
+# ============================================================
 
 def filter_orders(parsed):
 
@@ -252,33 +314,48 @@ def calculate(parsed):
 
     intent = parsed["intent"]
 
+
+    # --------------------------------------------------------
+    # TOTAL REVENUE
+    # --------------------------------------------------------
+
     if intent == "revenue":
 
-        filtered = [
+        paid = [
             o for o in filtered
             if o["status"] == "paid"
         ]
 
         total = sum(
             usd_amount(o)
-            for o in filtered
+            for o in paid
         )
 
         return round(total, 2)
 
+
+    # --------------------------------------------------------
+    # REFUNDS
+    # --------------------------------------------------------
+
     if intent == "refunds":
 
-        filtered = [
+        refunded = [
             o for o in filtered
             if o["status"] == "refunded"
         ]
 
         total = sum(
             usd_amount(o)
-            for o in filtered
+            for o in refunded
         )
 
         return round(total, 2)
+
+
+    # --------------------------------------------------------
+    # PRODUCT UNIT SALES
+    # --------------------------------------------------------
 
     if intent == "product_sales":
 
@@ -288,16 +365,104 @@ def calculate(parsed):
             if o["status"] == "paid"
         )
 
+
+    # --------------------------------------------------------
+    # CUSTOMER REVENUE
+    # --------------------------------------------------------
+
     if intent == "customer_sales":
 
-        return round(
-            sum(
-                usd_amount(o)
-                for o in filtered
-                if o["status"] == "paid"
-            ),
-            2
+        total = sum(
+            usd_amount(o)
+            for o in filtered
+            if o["status"] == "paid"
         )
+
+        return round(total, 2)
+
+
+    # --------------------------------------------------------
+    # PRODUCT WITH HIGHEST REVENUE
+    # --------------------------------------------------------
+
+    if intent == "top_product_revenue":
+
+        paid = [
+            o for o in filtered
+            if o["status"] == "paid"
+        ]
+
+        revenue_by_product = {}
+
+        for order in paid:
+            product = order["product"]
+
+            revenue_by_product[product] = (
+                revenue_by_product.get(product, 0)
+                + usd_amount(order)
+            )
+
+        if not revenue_by_product:
+            return None
+
+        best_product = max(
+            revenue_by_product,
+            key=revenue_by_product.get
+        )
+
+        return best_product
+
+
+    # --------------------------------------------------------
+    # PRODUCT WITH MOST UNITS SOLD
+    # --------------------------------------------------------
+
+    if intent == "top_product_sales":
+
+        paid = [
+            o for o in filtered
+            if o["status"] == "paid"
+        ]
+
+        units_by_product = {}
+
+        for order in paid:
+            product = order["product"]
+
+            units_by_product[product] = (
+                units_by_product.get(product, 0)
+                + order["qty"]
+            )
+
+        if not units_by_product:
+            return None
+
+        best_product = max(
+            units_by_product,
+            key=units_by_product.get
+        )
+
+        return best_product
+
+
+    # --------------------------------------------------------
+    # DISTINCT CUSTOMERS
+    # --------------------------------------------------------
+
+    if intent == "distinct_customers":
+
+        paid = [
+            o for o in filtered
+            if o["status"] == "paid"
+        ]
+
+        customers = {
+            o["customer"]
+            for o in paid
+        }
+
+        return len(customers)
+
 
     raise ValueError(f"Unknown intent: {intent}")
 
@@ -311,7 +476,12 @@ def answer_question(request: Question):
 
     parsed = understand_question(request.question)
 
+    print("QUESTION:", request.question)
+    print("PARSED:", parsed)
+
     answer = calculate(parsed)
+
+    print("ANSWER:", answer)
 
     return {
         "answer": answer
